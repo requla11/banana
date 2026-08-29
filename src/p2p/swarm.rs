@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactChunk {
@@ -217,6 +219,78 @@ impl P2PSwarmManager {
         None
     }
 
+    pub async fn run_tcp_server(&self, listener: TcpListener) -> Result<(), anyhow::Error> {
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let local_node = self.local_node.clone();
+
+            tokio::spawn(async move {
+                let mut len_buf = [0u8; 4];
+                if socket.read_exact(&mut len_buf).await.is_ok() {
+                    let header_len = u32::from_be_bytes(len_buf) as usize;
+                    let mut header_buf = vec![0u8; header_len];
+                    if socket.read_exact(&mut header_buf).await.is_ok()
+                        && let Ok(header) = serde_json::from_slice::<TcpFrameHeader>(&header_buf)
+                        && let Some(data) = local_node.get_artifact(&header.artifact_hash)
+                    {
+                        let manifest = ChunkManifest::create_from_bytes(
+                            &header.artifact_hash,
+                            &data,
+                            1024 * 1024,
+                        );
+                        if let Some(chunk) = manifest.chunks.get(header.chunk_index as usize) {
+                            let start = chunk.offset as usize;
+                            let end = (chunk.offset + chunk.size as u64) as usize;
+                            let chunk_slice = &data[start..end];
+
+                            let resp_len = (chunk_slice.len() as u32).to_be_bytes();
+                            let _ = socket.write_all(&resp_len).await;
+                            let _ = socket.write_all(chunk_slice).await;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    pub async fn fetch_chunk_over_tcp(
+        peer_addr: SocketAddr,
+        artifact_hash: &str,
+        chunk_index: u32,
+    ) -> Result<Vec<u8>, anyhow::Error> {
+        let mut stream = TcpStream::connect(peer_addr).await?;
+        let header = TcpFrameHeader {
+            magic: 0x42414E41,
+            artifact_hash: artifact_hash.to_string(),
+            chunk_index,
+            payload_size: 0,
+        };
+        let header_bytes = serde_json::to_vec(&header)?;
+        let len_bytes = (header_bytes.len() as u32).to_be_bytes();
+
+        stream.write_all(&len_bytes).await?;
+        stream.write_all(&header_bytes).await?;
+
+        let mut resp_len_buf = [0u8; 4];
+        stream.read_exact(&mut resp_len_buf).await?;
+        let payload_len = u32::from_be_bytes(resp_len_buf) as usize;
+
+        let mut payload = vec![0u8; payload_len];
+        stream.read_exact(&mut payload).await?;
+
+        Ok(payload)
+    }
+
+    pub async fn broadcast_beacon(
+        socket: &UdpSocket,
+        target_addr: SocketAddr,
+        node: &P2PNode,
+    ) -> Result<(), anyhow::Error> {
+        let payload = node.create_beacon_payload();
+        socket.send_to(&payload, target_addr).await?;
+        Ok(())
+    }
+
     pub fn get_local_node(&self) -> &P2PNode {
         &self.local_node
     }
@@ -267,5 +341,28 @@ mod tests {
         let peers = manager1.find_peers_with_artifact("hash-abc");
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].node_id, "node-beta");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_streaming_e2e() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local_addr = listener.local_addr().unwrap();
+
+        let node = P2PNode::new("provider-node", local_addr);
+        let raw_data = b"enterprise grade async chunk transfer over tcp socket stream";
+        let hash = blake3::hash(raw_data).to_hex().to_string();
+        node.store_artifact(&hash, raw_data.to_vec());
+
+        let manager = Arc::new(P2PSwarmManager::new(node));
+        let manager_clone = manager.clone();
+
+        tokio::spawn(async move {
+            let _ = manager_clone.run_tcp_server(listener).await;
+        });
+
+        let chunk = P2PSwarmManager::fetch_chunk_over_tcp(local_addr, &hash, 0)
+            .await
+            .unwrap();
+        assert_eq!(chunk, raw_data);
     }
 }
