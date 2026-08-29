@@ -196,27 +196,23 @@ impl P2PSwarmManager {
         sender_addr: SocketAddr,
         packet: &[u8],
     ) -> Option<PeerDescriptor> {
-        if let Ok(msg) = serde_json::from_slice::<UdpBeaconMessage>(packet) {
-            match msg {
-                UdpBeaconMessage::Announce {
+        if let Ok(UdpBeaconMessage::Announce {
+            node_id,
+            port,
+            artifacts,
+        }) = serde_json::from_slice::<UdpBeaconMessage>(packet)
+        {
+            if node_id != self.local_node.id {
+                let mut effective_addr = sender_addr;
+                effective_addr.set_port(port);
+                let peer = PeerDescriptor {
                     node_id,
-                    port,
-                    artifacts,
-                } => {
-                    if node_id != self.local_node.id {
-                        let mut effective_addr = sender_addr;
-                        effective_addr.set_port(port);
-                        let peer = PeerDescriptor {
-                            node_id: node_id.clone(),
-                            addr: effective_addr,
-                            available_artifacts: artifacts,
-                            latency_ms: 1,
-                        };
-                        self.register_peer(peer.clone());
-                        return Some(peer);
-                    }
-                }
-                _ => {}
+                    addr: effective_addr,
+                    available_artifacts: artifacts,
+                    latency_ms: 1,
+                };
+                self.register_peer(peer.clone());
+                return Some(peer);
             }
         }
         None

@@ -68,15 +68,15 @@ impl DependencyGraph {
 
     fn dfs_cycle(
         &self,
-        current: &PathBuf,
+        current: &Path,
         visited: &mut HashSet<PathBuf>,
         on_stack: &mut HashSet<PathBuf>,
         current_path: &mut Vec<PathBuf>,
         cycles: &mut Vec<Vec<PathBuf>>,
     ) {
-        visited.insert(current.clone());
-        on_stack.insert(current.clone());
-        current_path.push(current.clone());
+        visited.insert(current.to_path_buf());
+        on_stack.insert(current.to_path_buf());
+        current_path.push(current.to_path_buf());
 
         if let Some(neighbors) = self.edges.get(current) {
             for next in neighbors {

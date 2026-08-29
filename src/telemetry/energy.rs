@@ -37,14 +37,9 @@ pub struct LinuxRaplReader;
 impl LinuxRaplReader {
     pub fn read_energy_microjoules() -> Option<u64> {
         let rapl_path = Path::new("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj");
-        if rapl_path.exists() {
-            if let Ok(content) = fs::read_to_string(rapl_path) {
-                if let Ok(val) = content.trim().parse::<u64>() {
-                    return Some(val);
-                }
-            }
-        }
-        None
+        fs::read_to_string(rapl_path)
+            .ok()
+            .and_then(|content| content.trim().parse::<u64>().ok())
     }
 }
 
