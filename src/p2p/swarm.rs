@@ -201,19 +201,18 @@ impl P2PSwarmManager {
             port,
             artifacts,
         }) = serde_json::from_slice::<UdpBeaconMessage>(packet)
+            && node_id != self.local_node.id
         {
-            if node_id != self.local_node.id {
-                let mut effective_addr = sender_addr;
-                effective_addr.set_port(port);
-                let peer = PeerDescriptor {
-                    node_id,
-                    addr: effective_addr,
-                    available_artifacts: artifacts,
-                    latency_ms: 1,
-                };
-                self.register_peer(peer.clone());
-                return Some(peer);
-            }
+            let mut effective_addr = sender_addr;
+            effective_addr.set_port(port);
+            let peer = PeerDescriptor {
+                node_id,
+                addr: effective_addr,
+                available_artifacts: artifacts,
+                latency_ms: 1,
+            };
+            self.register_peer(peer.clone());
+            return Some(peer);
         }
         None
     }

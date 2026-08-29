@@ -82,12 +82,12 @@ impl DependencyGraph {
             for next in neighbors {
                 if !visited.contains(next) {
                     self.dfs_cycle(next, visited, on_stack, current_path, cycles);
-                } else if on_stack.contains(next) {
-                    if let Some(pos) = current_path.iter().position(|p| p == next) {
-                        let mut cycle = current_path[pos..].to_vec();
-                        cycle.push(next.clone());
-                        cycles.push(cycle);
-                    }
+                } else if on_stack.contains(next)
+                    && let Some(pos) = current_path.iter().position(|p| p == next)
+                {
+                    let mut cycle = current_path[pos..].to_vec();
+                    cycle.push(next.clone());
+                    cycles.push(cycle);
                 }
             }
         }
