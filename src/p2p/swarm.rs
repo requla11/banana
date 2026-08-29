@@ -143,7 +143,7 @@ impl P2PSwarmManager {
     pub fn sync_artifact_from_swarm(
         &self,
         artifact_hash: &str,
-        chunk_size: usize,
+        _chunk_size: usize,
     ) -> Option<Vec<u8>> {
         if let Some(local_data) = self.local_node.get_artifact(artifact_hash) {
             return Some(local_data);
