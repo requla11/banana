@@ -4,7 +4,7 @@
 > [English](../../README.md) | [Tiếng Việt](README.md) | [日本語](../ja/README.md) | [简体中文](../zh-hans/README.md) | [繁體中文](../zh-hant/README.md)
 
 [![Banana CI](https://github.com/requla11/banana/actions/workflows/ci.yml/badge.svg)](https://github.com/requla11/banana/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](../../LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](../../LICENSE)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024%20Edition-orange.svg)](../../Cargo.toml)
 [![MSRV: 1.88+](https://img.shields.io/badge/MSRV-1.88%2B-purple.svg)](../../Cargo.toml)
 
@@ -77,5 +77,5 @@ banana ast --file ./src/main.rs
 ---
 
 ## 📜 Giấy Phép Bản Quyền
+Dự án được phân phối theo giấy phép [MIT License](../../LICENSE).
 
-Dự án được phân phối dưới giấy phép kép [Apache License, Version 2.0](../../LICENSE) hoặc [MIT License](../../LICENSE).
