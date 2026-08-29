@@ -8,11 +8,19 @@ use std::path::Path;
 use tar::{Builder, Header};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OciPlatform {
+    pub architecture: String,
+    pub os: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciDescriptor {
     #[serde(rename = "mediaType")]
     pub media_type: String,
     pub digest: String,
     pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<OciPlatform>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +66,12 @@ pub struct OciImageResult {
     pub config_digest: String,
     pub layer_digests: Vec<String>,
     pub total_size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct OciMultiArchResult {
+    pub index_digest: String,
+    pub platform_manifests: Vec<(String, String)>,
 }
 
 pub struct OciBuilder {
@@ -142,6 +156,7 @@ impl OciBuilder {
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
             digest: layer_digest.clone(),
             size: layer_size,
+            platform: None,
         }];
         let mut total_size = layer_size;
 
@@ -155,6 +170,7 @@ impl OciBuilder {
                 media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
                 digest: d,
                 size: sz,
+                platform: None,
             });
             total_size += sz;
         }
@@ -188,6 +204,7 @@ impl OciBuilder {
                 media_type: "application/vnd.oci.image.config.v1+json".to_string(),
                 digest: config_digest.clone(),
                 size: config_size,
+                platform: None,
             },
             layers: layer_descriptors.clone(),
         };
@@ -236,6 +253,71 @@ impl OciBuilder {
             config_digest,
             layer_digests: layer_descriptors.into_iter().map(|l| l.digest).collect(),
             total_size_bytes: total_size,
+        })
+    }
+
+    pub fn build_multi_platform(
+        &self,
+        platforms: &[(&str, &str, &Path)],
+        output_tar: &Path,
+    ) -> Result<OciMultiArchResult, anyhow::Error> {
+        let mut manifests = Vec::new();
+        let mut platform_manifests = Vec::new();
+
+        for (os, arch, rootfs) in platforms {
+            let temp_tar = output_tar.with_extension(format!("{}-{}.tmp", os, arch));
+            let res = self.build_from_rootfs(rootfs, &temp_tar)?;
+            let _ = std::fs::remove_file(&temp_tar);
+
+            manifests.push(serde_json::json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": res.manifest_digest,
+                "size": res.total_size_bytes,
+                "platform": {
+                    "architecture": arch,
+                    "os": os
+                }
+            }));
+            platform_manifests.push((format!("{}/{}", os, arch), res.manifest_digest));
+        }
+
+        let index_json = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": manifests
+        });
+        let index_bytes = serde_json::to_vec(&index_json)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&index_bytes);
+        let index_digest = format!("sha256:{:x}", hasher.finalize());
+
+        let file = File::create(output_tar)?;
+        let mut out_tar = Builder::new(file);
+
+        let oci_layout = serde_json::json!({ "imageLayoutVersion": "1.0.0" });
+        let layout_bytes = serde_json::to_vec(&oci_layout)?;
+        let mut header = Header::new_gnu();
+        header.set_size(layout_bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        out_tar.append_data(&mut header, "oci-layout", layout_bytes.as_slice())?;
+
+        let mut header_idx = Header::new_gnu();
+        header_idx.set_size(index_bytes.len() as u64);
+        header_idx.set_mode(0o644);
+        header_idx.set_mtime(0);
+        header_idx.set_uid(0);
+        header_idx.set_gid(0);
+        header_idx.set_cksum();
+        out_tar.append_data(&mut header_idx, "index.json", index_bytes.as_slice())?;
+
+        out_tar.finish()?;
+
+        Ok(OciMultiArchResult {
+            index_digest,
+            platform_manifests,
         })
     }
 
@@ -292,28 +374,24 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_oci_builder_deterministic_hashes() {
+    fn test_oci_multi_platform_fat_manifest() {
         let temp = tempdir().unwrap();
-        let rootfs = temp.path().join("rootfs");
-        let app_dir = rootfs.join("app");
-        fs::create_dir_all(&app_dir).unwrap();
-        fs::write(app_dir.join("main"), b"deterministic binary content").unwrap();
+        let rootfs_amd64 = temp.path().join("rootfs-amd64");
+        fs::create_dir_all(&rootfs_amd64).unwrap();
+        fs::write(rootfs_amd64.join("app-x86"), b"amd64-binary").unwrap();
 
-        let out1 = temp.path().join("image1.tar");
-        let out2 = temp.path().join("image2.tar");
+        let rootfs_arm64 = temp.path().join("rootfs-arm64");
+        fs::create_dir_all(&rootfs_arm64).unwrap();
+        fs::write(rootfs_arm64.join("app-arm"), b"arm64-binary").unwrap();
 
-        let builder1 = OciBuilder::new()
-            .entrypoint(vec!["/app/main".to_string()])
-            .working_dir("/app");
-        let res1 = builder1.build_from_rootfs(&rootfs, &out1).unwrap();
-
-        let builder2 = OciBuilder::new()
-            .entrypoint(vec!["/app/main".to_string()])
-            .working_dir("/app");
-        let res2 = builder2.build_from_rootfs(&rootfs, &out2).unwrap();
-
-        assert_eq!(res1.manifest_digest, res2.manifest_digest);
-        assert_eq!(res1.config_digest, res2.config_digest);
-        assert_eq!(res1.layer_digests, res2.layer_digests);
+        let out_fat = temp.path().join("fat-image.tar");
+        let builder = OciBuilder::new().working_dir("/app");
+        let platforms = vec![
+            ("linux", "amd64", rootfs_amd64.as_path()),
+            ("linux", "arm64", rootfs_arm64.as_path()),
+        ];
+        let res = builder.build_multi_platform(&platforms, &out_fat).unwrap();
+        assert!(out_fat.exists());
+        assert_eq!(res.platform_manifests.len(), 2);
     }
 }

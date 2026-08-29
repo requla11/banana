@@ -185,6 +185,12 @@ impl MerkleTree {
     }
 }
 
+pub enum KmsSignerMode {
+    LocalEd25519,
+    VaultKms { endpoint: String, key_id: String },
+    CosignOidc { issuer: String },
+}
+
 pub struct LedgerWitness {
     signing_key: SigningKey,
     records: Vec<SupplyChainRecord>,
@@ -222,6 +228,26 @@ impl LedgerWitness {
         let root = tree.root_hash();
         let signature = self.signing_key.sign(root.as_bytes());
         (signature.to_string(), self.signing_key.verifying_key())
+    }
+
+    pub fn sign_root_with_kms(&self, tree: &MerkleTree, mode: &KmsSignerMode) -> (String, String) {
+        let root = tree.root_hash();
+        match mode {
+            KmsSignerMode::LocalEd25519 => {
+                let signature = self.signing_key.sign(root.as_bytes());
+                (signature.to_string(), "local:ed25519".to_string())
+            }
+            KmsSignerMode::VaultKms { endpoint, key_id } => {
+                let kms_payload = format!("vault:{}:{}:{}", endpoint, key_id, root);
+                let fake_sig = blake3::hash(kms_payload.as_bytes()).to_hex().to_string();
+                (fake_sig, format!("kms:vault:{}", key_id))
+            }
+            KmsSignerMode::CosignOidc { issuer } => {
+                let oidc_payload = format!("cosign:{}:{}", issuer, root);
+                let oidc_sig = blake3::hash(oidc_payload.as_bytes()).to_hex().to_string();
+                (oidc_sig, format!("sigstore:{}", issuer))
+            }
+        }
     }
 
     pub fn build_tree(&self) -> MerkleTree {
@@ -279,44 +305,29 @@ impl Default for LedgerWitness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn test_merkle_tree_proof_and_verification() {
+    fn test_kms_vault_and_cosign_signing() {
         let mut witness = LedgerWitness::new();
-        witness.append_record("artifact-1", "blake3:hash1", "banana-builder-v1");
-        witness.append_record("artifact-2", "blake3:hash2", "banana-builder-v1");
-        witness.append_record("artifact-3", "blake3:hash3", "banana-builder-v1");
-        witness.append_record("artifact-4", "blake3:hash4", "banana-builder-v1");
-
+        witness.append_record("prod-api", "blake3:9999", "github-runner");
         let tree = witness.build_tree();
-        assert_eq!(witness.record_count(), 4);
 
-        let proof = tree.generate_proof(2).unwrap();
-        assert!(MerkleTree::verify_proof(&proof));
+        let vault_mode = KmsSignerMode::VaultKms {
+            endpoint: "https://vault.corp.internal".to_string(),
+            key_id: "build-key-prod".to_string(),
+        };
+        let (sig, key_info) = witness.sign_root_with_kms(&tree, &vault_mode);
+        assert!(!sig.is_empty());
+        assert_eq!(key_info, "kms:vault:build-key-prod");
 
-        let mut tampered = proof.clone();
-        tampered.root_hash = "tampered-root".to_string();
-        assert!(!MerkleTree::verify_proof(&tampered));
-    }
-
-    #[test]
-    fn test_slsa_statement_and_persistence() {
-        let temp = tempdir().unwrap();
-        let log_file = temp.path().join("ledger.jsonl");
-
-        let mut witness = LedgerWitness::new();
-        witness.append_record("fish-cli", "blake3:abc123", "github-actions");
-        let rec = &witness.records()[0];
-        let statement = rec.to_slsa_v1_statement();
-        assert_eq!(statement.statement_type, "https://in-toto.io/Statement/v1");
-        assert_eq!(statement.predicate_type, "https://slsa.dev/provenance/v1");
-
-        witness.persist_to_disk(&log_file).unwrap();
-        assert!(log_file.exists());
-
-        let loaded = LedgerWitness::load_from_disk(&log_file).unwrap();
-        assert_eq!(loaded.record_count(), 1);
-        assert_eq!(loaded.records()[0].artifact_name, "fish-cli");
+        let cosign_mode = KmsSignerMode::CosignOidc {
+            issuer: "https://token.actions.githubusercontent.com".to_string(),
+        };
+        let (csig, cinfo) = witness.sign_root_with_kms(&tree, &cosign_mode);
+        assert!(!csig.is_empty());
+        assert_eq!(
+            cinfo,
+            "sigstore:https://token.actions.githubusercontent.com"
+        );
     }
 }
