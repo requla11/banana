@@ -76,6 +76,31 @@ pub struct PeerDescriptor {
     pub latency_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UdpBeaconMessage {
+    Announce {
+        node_id: String,
+        port: u16,
+        artifacts: Vec<String>,
+    },
+    Query {
+        artifact_hash: String,
+    },
+    QueryResponse {
+        node_id: String,
+        artifact_hash: String,
+        has_artifact: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpFrameHeader {
+    pub magic: u32,
+    pub artifact_hash: String,
+    pub chunk_index: u32,
+    pub payload_size: u32,
+}
+
 #[derive(Clone)]
 pub struct P2PNode {
     pub id: String,
@@ -105,6 +130,15 @@ impl P2PNode {
     pub fn list_artifacts(&self) -> Vec<String> {
         let map = self.artifacts.read().unwrap();
         map.keys().cloned().collect()
+    }
+
+    pub fn create_beacon_payload(&self) -> Vec<u8> {
+        let msg = UdpBeaconMessage::Announce {
+            node_id: self.id.clone(),
+            port: self.addr.port(),
+            artifacts: self.list_artifacts(),
+        };
+        serde_json::to_vec(&msg).unwrap_or_default()
     }
 }
 
@@ -157,6 +191,37 @@ impl P2PSwarmManager {
         None
     }
 
+    pub fn handle_beacon_packet(
+        &self,
+        sender_addr: SocketAddr,
+        packet: &[u8],
+    ) -> Option<PeerDescriptor> {
+        if let Ok(msg) = serde_json::from_slice::<UdpBeaconMessage>(packet) {
+            match msg {
+                UdpBeaconMessage::Announce {
+                    node_id,
+                    port,
+                    artifacts,
+                } => {
+                    if node_id != self.local_node.id {
+                        let mut effective_addr = sender_addr;
+                        effective_addr.set_port(port);
+                        let peer = PeerDescriptor {
+                            node_id: node_id.clone(),
+                            addr: effective_addr,
+                            available_artifacts: artifacts,
+                            latency_ms: 1,
+                        };
+                        self.register_peer(peer.clone());
+                        return Some(peer);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn get_local_node(&self) -> &P2PNode {
         &self.local_node
     }
@@ -186,27 +251,26 @@ mod tests {
     }
 
     #[test]
-    fn test_p2p_swarm_peer_discovery() {
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let node = P2PNode::new("node-alpha", addr);
-        node.store_artifact("hash-123", b"artifact payload".to_vec());
+    fn test_p2p_swarm_beacon_handling() {
+        let addr1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let node1 = P2PNode::new("node-alpha", addr1);
+        node1.store_artifact("hash-abc", b"alpha data".to_vec());
 
-        let manager = P2PSwarmManager::new(node);
-        assert_eq!(manager.peer_count(), 0);
+        let addr2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let node2 = P2PNode::new("node-beta", addr2);
+        node2.store_artifact("hash-abc", b"beta data".to_vec());
 
-        let peer_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
-        let peer = PeerDescriptor {
-            node_id: "node-beta".to_string(),
-            addr: peer_addr,
-            available_artifacts: vec!["hash-456".to_string(), "hash-123".to_string()],
-            latency_ms: 5,
-        };
+        let manager1 = P2PSwarmManager::new(node1);
+        let beacon_payload = node2.create_beacon_payload();
 
-        manager.register_peer(peer);
-        assert_eq!(manager.peer_count(), 1);
+        let peer = manager1
+            .handle_beacon_packet(addr2, &beacon_payload)
+            .unwrap();
+        assert_eq!(peer.node_id, "node-beta");
+        assert_eq!(manager1.peer_count(), 1);
 
-        let found = manager.find_peers_with_artifact("hash-123");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].node_id, "node-beta");
+        let peers = manager1.find_peers_with_artifact("hash-abc");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].node_id, "node-beta");
     }
 }

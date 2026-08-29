@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -8,6 +10,7 @@ pub struct EnergyMetrics {
     pub estimated_watt_hours: f64,
     pub carbon_grams_co2: f64,
     pub cpu_cores_utilized: f64,
+    pub is_hardware_measured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,9 +32,26 @@ impl Default for HardwareProfile {
     }
 }
 
+pub struct LinuxRaplReader;
+
+impl LinuxRaplReader {
+    pub fn read_energy_microjoules() -> Option<u64> {
+        let rapl_path = Path::new("/sys/class/powercap/intel-rapl/intel-rapl:0/energy_uj");
+        if rapl_path.exists() {
+            if let Ok(content) = fs::read_to_string(rapl_path) {
+                if let Ok(val) = content.trim().parse::<u64>() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+}
+
 pub struct EnergyMeter {
     profile: HardwareProfile,
     start_time: Option<Instant>,
+    start_microjoules: Option<u64>,
     grid_intensity_g_per_kwh: f64,
 }
 
@@ -40,12 +60,14 @@ impl EnergyMeter {
         Self {
             profile,
             start_time: None,
+            start_microjoules: None,
             grid_intensity_g_per_kwh,
         }
     }
 
     pub fn start(&mut self) {
         self.start_time = Some(Instant::now());
+        self.start_microjoules = LinuxRaplReader::read_energy_microjoules();
     }
 
     pub fn stop(&self, cpu_utilization_ratio: f64) -> EnergyMetrics {
@@ -56,10 +78,23 @@ impl EnergyMeter {
 
         let duration_secs = duration.as_secs_f64();
         let util = cpu_utilization_ratio.clamp(0.0, 1.0);
-        let active_power = self.profile.idle_power_watts
-            + (self.profile.tdp_watts - self.profile.idle_power_watts) * util;
 
-        let estimated_joules = active_power * duration_secs;
+        let end_microjoules = LinuxRaplReader::read_energy_microjoules();
+        let (estimated_joules, is_hw) =
+            if let (Some(start_uj), Some(end_uj)) = (self.start_microjoules, end_microjoules) {
+                if end_uj >= start_uj {
+                    ((end_uj - start_uj) as f64 / 1_000_000.0, true)
+                } else {
+                    let active_power = self.profile.idle_power_watts
+                        + (self.profile.tdp_watts - self.profile.idle_power_watts) * util;
+                    (active_power * duration_secs, false)
+                }
+            } else {
+                let active_power = self.profile.idle_power_watts
+                    + (self.profile.tdp_watts - self.profile.idle_power_watts) * util;
+                (active_power * duration_secs, false)
+            };
+
         let estimated_watt_hours = estimated_joules / 3600.0;
         let carbon_grams_co2 = (estimated_watt_hours / 1000.0) * self.grid_intensity_g_per_kwh;
         let cpu_cores_utilized = self.profile.core_count as f64 * util;
@@ -70,6 +105,7 @@ impl EnergyMeter {
             estimated_watt_hours,
             carbon_grams_co2,
             cpu_cores_utilized,
+            is_hardware_measured: is_hw,
         }
     }
 }

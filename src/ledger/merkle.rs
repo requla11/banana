@@ -2,6 +2,10 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupplyChainRecord {
@@ -10,6 +14,65 @@ pub struct SupplyChainRecord {
     pub artifact_hash: String,
     pub builder_id: String,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InTotoSubject {
+    pub name: String,
+    pub digest: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlsaProvenancePredicate {
+    #[serde(rename = "builder")]
+    pub builder: SlsaBuilder,
+    #[serde(rename = "buildType")]
+    pub build_type: String,
+    #[serde(rename = "invocation")]
+    pub invocation: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlsaBuilder {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InTotoStatement {
+    #[serde(rename = "_type")]
+    pub statement_type: String,
+    #[serde(rename = "subject")]
+    pub subject: Vec<InTotoSubject>,
+    #[serde(rename = "predicateType")]
+    pub predicate_type: String,
+    #[serde(rename = "predicate")]
+    pub predicate: SlsaProvenancePredicate,
+}
+
+impl SupplyChainRecord {
+    pub fn to_slsa_v1_statement(&self) -> InTotoStatement {
+        let mut digests = HashMap::new();
+        digests.insert("blake3".to_string(), self.artifact_hash.clone());
+
+        InTotoStatement {
+            statement_type: "https://in-toto.io/Statement/v1".to_string(),
+            subject: vec![InTotoSubject {
+                name: self.artifact_name.clone(),
+                digest: digests,
+            }],
+            predicate_type: "https://slsa.dev/provenance/v1".to_string(),
+            predicate: SlsaProvenancePredicate {
+                builder: SlsaBuilder {
+                    id: self.builder_id.clone(),
+                },
+                build_type: "https://requla.org/banana/build/v1".to_string(),
+                invocation: serde_json::json!({
+                    "sequenceNumber": self.sequence_number,
+                    "timestamp": self.timestamp.to_rfc3339()
+                }),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +231,43 @@ impl LedgerWitness {
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
+
+    pub fn records(&self) -> &[SupplyChainRecord] {
+        &self.records
+    }
+
+    pub fn persist_to_disk(&self, path: &Path) -> Result<(), anyhow::Error> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+
+        for record in &self.records {
+            let line = serde_json::to_string(record)?;
+            writeln!(file, "{}", line)?;
+        }
+        Ok(())
+    }
+
+    pub fn load_from_disk(path: &Path) -> Result<Self, anyhow::Error> {
+        let mut witness = Self::new();
+        if !path.exists() {
+            return Ok(witness);
+        }
+
+        let file = OpenOptions::new().read(true).open(path)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if !line.trim().is_empty() {
+                let record: SupplyChainRecord = serde_json::from_str(&line)?;
+                witness.records.push(record);
+            }
+        }
+        Ok(witness)
+    }
 }
 
 impl Default for LedgerWitness {
@@ -179,6 +279,7 @@ impl Default for LedgerWitness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_merkle_tree_proof_and_verification() {
@@ -197,5 +298,25 @@ mod tests {
         let mut tampered = proof.clone();
         tampered.root_hash = "tampered-root".to_string();
         assert!(!MerkleTree::verify_proof(&tampered));
+    }
+
+    #[test]
+    fn test_slsa_statement_and_persistence() {
+        let temp = tempdir().unwrap();
+        let log_file = temp.path().join("ledger.jsonl");
+
+        let mut witness = LedgerWitness::new();
+        witness.append_record("fish-cli", "blake3:abc123", "github-actions");
+        let rec = &witness.records()[0];
+        let statement = rec.to_slsa_v1_statement();
+        assert_eq!(statement.statement_type, "https://in-toto.io/Statement/v1");
+        assert_eq!(statement.predicate_type, "https://slsa.dev/provenance/v1");
+
+        witness.persist_to_disk(&log_file).unwrap();
+        assert!(log_file.exists());
+
+        let loaded = LedgerWitness::load_from_disk(&log_file).unwrap();
+        assert_eq!(loaded.record_count(), 1);
+        assert_eq!(loaded.records()[0].artifact_name, "fish-cli");
     }
 }

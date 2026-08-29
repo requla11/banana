@@ -65,6 +65,7 @@ pub struct OciBuilder {
     cmd: Vec<String>,
     env: Vec<String>,
     working_dir: String,
+    extra_layers: Vec<Vec<u8>>,
 }
 
 impl Default for OciBuilder {
@@ -74,6 +75,7 @@ impl Default for OciBuilder {
             cmd: Vec::new(),
             env: vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()],
             working_dir: "/app".to_string(),
+            extra_layers: Vec::new(),
         }
     }
 }
@@ -103,6 +105,11 @@ impl OciBuilder {
         self
     }
 
+    pub fn add_raw_layer(mut self, layer_tar_gz: Vec<u8>) -> Self {
+        self.extra_layers.push(layer_tar_gz);
+        self
+    }
+
     pub fn build_from_rootfs(
         &self,
         rootfs_dir: &Path,
@@ -112,7 +119,7 @@ impl OciBuilder {
         {
             let mut tar_builder = Builder::new(&mut layer_tar_bytes);
             if rootfs_dir.exists() {
-                tar_builder.append_dir_all(".", rootfs_dir)?;
+                self.append_dir_deterministic(&mut tar_builder, rootfs_dir, Path::new(""))?;
             }
             tar_builder.finish()?;
         }
@@ -130,12 +137,34 @@ impl OciBuilder {
         let layer_digest = format!("sha256:{:x}", hasher_compressed.finalize());
         let layer_size = layer_gz_bytes.len() as u64;
 
+        let mut diff_ids = vec![diff_id];
+        let mut layer_descriptors = vec![OciDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+            digest: layer_digest.clone(),
+            size: layer_size,
+        }];
+        let mut total_size = layer_size;
+
+        for extra in &self.extra_layers {
+            let mut hasher = Sha256::new();
+            hasher.update(extra);
+            let d = format!("sha256:{:x}", hasher.finalize());
+            let sz = extra.len() as u64;
+            diff_ids.push(d.clone());
+            layer_descriptors.push(OciDescriptor {
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                digest: d,
+                size: sz,
+            });
+            total_size += sz;
+        }
+
         let config_obj = OciConfig {
             architecture: "amd64".to_string(),
             os: "linux".to_string(),
             rootfs: OciRootfsConfig {
                 rootfs_type: "layers".to_string(),
-                diff_ids: vec![diff_id],
+                diff_ids,
             },
             config: OciExecutionConfig {
                 entrypoint: self.entrypoint.clone(),
@@ -150,6 +179,7 @@ impl OciBuilder {
         hasher_config.update(&config_json);
         let config_digest = format!("sha256:{:x}", hasher_config.finalize());
         let config_size = config_json.len() as u64;
+        total_size += config_size;
 
         let manifest_obj = OciManifest {
             schema_version: 2,
@@ -159,11 +189,7 @@ impl OciBuilder {
                 digest: config_digest.clone(),
                 size: config_size,
             },
-            layers: vec![OciDescriptor {
-                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
-                digest: layer_digest.clone(),
-                size: layer_size,
-            }],
+            layers: layer_descriptors.clone(),
         };
 
         let manifest_json = serde_json::to_vec(&manifest_obj)?;
@@ -179,6 +205,9 @@ impl OciBuilder {
         let mut header = Header::new_gnu();
         header.set_size(layout_bytes.len() as u64);
         header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_cksum();
         out_tar.append_data(&mut header, "oci-layout", layout_bytes.as_slice())?;
 
@@ -194,6 +223,9 @@ impl OciBuilder {
         let mut header = Header::new_gnu();
         header.set_size(index_bytes.len() as u64);
         header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
         header.set_cksum();
         out_tar.append_data(&mut header, "index.json", index_bytes.as_slice())?;
 
@@ -202,9 +234,54 @@ impl OciBuilder {
         Ok(OciImageResult {
             manifest_digest,
             config_digest,
-            layer_digests: vec![layer_digest],
-            total_size_bytes: layer_size + config_size,
+            layer_digests: layer_descriptors.into_iter().map(|l| l.digest).collect(),
+            total_size_bytes: total_size,
         })
+    }
+
+    fn append_dir_deterministic<W: Write>(
+        &self,
+        tar: &mut Builder<W>,
+        src_dir: &Path,
+        dest_prefix: &Path,
+    ) -> Result<(), anyhow::Error> {
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(src_dir)? {
+            let entry = entry?;
+            entries.push(entry.path());
+        }
+        entries.sort();
+
+        for path in entries {
+            let file_name = path.file_name().unwrap_or_default();
+            let dest_path = dest_prefix.join(file_name);
+            let dest_str = dest_path.to_string_lossy().replace('\\', "/");
+
+            if path.is_dir() {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
+                header.set_mode(0o755);
+                header.set_size(0);
+                header.set_mtime(0);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_cksum();
+                tar.append_data(&mut header, &dest_str, &[][..])?;
+                self.append_dir_deterministic(tar, &path, &dest_path)?;
+            } else {
+                let content = std::fs::read(&path)?;
+                let mut header = Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o755);
+                header.set_size(content.len() as u64);
+                header.set_mtime(0);
+                header.set_uid(0);
+                header.set_gid(0);
+                header.set_cksum();
+                tar.append_data(&mut header, &dest_str, content.as_slice())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -215,22 +292,28 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn test_oci_builder_creates_compliant_image_tar() {
+    fn test_oci_builder_deterministic_hashes() {
         let temp = tempdir().unwrap();
         let rootfs = temp.path().join("rootfs");
         let app_dir = rootfs.join("app");
         fs::create_dir_all(&app_dir).unwrap();
-        fs::write(app_dir.join("main"), b"binary-content").unwrap();
+        fs::write(app_dir.join("main"), b"deterministic binary content").unwrap();
 
-        let out_image = temp.path().join("image.tar");
-        let builder = OciBuilder::new()
+        let out1 = temp.path().join("image1.tar");
+        let out2 = temp.path().join("image2.tar");
+
+        let builder1 = OciBuilder::new()
             .entrypoint(vec!["/app/main".to_string()])
             .working_dir("/app");
+        let res1 = builder1.build_from_rootfs(&rootfs, &out1).unwrap();
 
-        let result = builder.build_from_rootfs(&rootfs, &out_image).unwrap();
-        assert!(out_image.exists());
-        assert!(result.manifest_digest.starts_with("sha256:"));
-        assert!(result.config_digest.starts_with("sha256:"));
-        assert_eq!(result.layer_digests.len(), 1);
+        let builder2 = OciBuilder::new()
+            .entrypoint(vec!["/app/main".to_string()])
+            .working_dir("/app");
+        let res2 = builder2.build_from_rootfs(&rootfs, &out2).unwrap();
+
+        assert_eq!(res1.manifest_digest, res2.manifest_digest);
+        assert_eq!(res1.config_digest, res2.config_digest);
+        assert_eq!(res1.layer_digests, res2.layer_digests);
     }
 }

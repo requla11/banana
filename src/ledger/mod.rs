@@ -1,3 +1,6 @@
 pub mod merkle;
 
-pub use merkle::{LedgerWitness, MerkleProof, MerkleTree, SupplyChainRecord};
+pub use merkle::{
+    InTotoStatement, InTotoSubject, LedgerWitness, MerkleProof, MerkleTree, SlsaBuilder,
+    SlsaProvenancePredicate, SupplyChainRecord,
+};

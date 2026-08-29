@@ -1,3 +1,6 @@
 pub mod swarm;
 
-pub use swarm::{ArtifactChunk, ChunkManifest, P2PNode, P2PSwarmManager, PeerDescriptor};
+pub use swarm::{
+    ArtifactChunk, ChunkManifest, P2PNode, P2PSwarmManager, PeerDescriptor, TcpFrameHeader,
+    UdpBeaconMessage,
+};
